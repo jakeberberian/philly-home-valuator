@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code memory
+.claude/
+
+# ── Data: raw & intermediate (large, regenerable — not needed by dashboard) ──
+data/redfin_sold_homes.csv
+data/redfin_with_census.csv
+data/model_results.csv
+
+# ── Models: full 4-county model (not used by dashboard) ─────────────────────
+models/hedonic_model.joblib
+
+# ── Plots: generated output ──────────────────────────────────────────────────
+plots/
+
+# ── Dashboard artifacts: DO commit these (Render needs them) ─────────────────
+# data/census_zcta.csv          ← tracked
+# data/model_results_filtered.csv ← tracked
+# models/hedonic_model_filtered.joblib ← tracked
