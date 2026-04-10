@@ -4,6 +4,9 @@ Three tabs: Home Valuation | Market Map | Mortgage & Bankroll
 Run:  python 05_dashboard_app.py
 """
 import os
+import json
+import math
+import datetime
 import numpy as np
 import pandas as pd
 import joblib
@@ -19,8 +22,28 @@ RESULTS_PATH = "data/model_results_filtered.csv"
 
 saved        = joblib.load(MODEL_PATH)
 model        = saved["model"]
+quantile_lo  = saved.get("quantile_lo")
+quantile_hi  = saved.get("quantile_hi")
 feature_cols = saved["feature_cols"]
 resid_std    = saved["residual_std"]
+LAT_MEAN     = saved.get("lat_mean", 40.0917)
+LON_MEAN     = saved.get("lon_mean", -75.3262)
+LOT_99       = saved.get("lot_99", 43560.0)
+# v3 model flags
+LOG_TARGET_MODEL   = saved.get("log_target", False)        # True → exp() predictions
+QUINTILE_BREAKS    = saved.get("quintile_breaks", [])      # 4 price breaks for 5 buckets
+QUINTILE_SIGMA     = saved.get("quintile_sigma", [])       # per-bucket residual sigma
+MODEL_PRICE_MAX    = saved.get("price_max", 750_000)       # training data upper bound
+
+
+def _segment_sigma(fair_value: float) -> float:
+    """Return per-predicted-quintile residual sigma for segment-aware intervals."""
+    if not QUINTILE_BREAKS or not QUINTILE_SIGMA:
+        return resid_std
+    for i, brk in enumerate(QUINTILE_BREAKS):
+        if fair_value < brk:
+            return QUINTILE_SIGMA[i]
+    return QUINTILE_SIGMA[-1]
 
 census_df = pd.read_csv(CENSUS_PATH)
 census_df["zip"] = census_df["zip"].astype(str).str.zfill(5)
@@ -46,9 +69,33 @@ try:
     ).query("n >= 5")
     zip_grp["hot_score"] = zip_grp["resid_median"] / resid_std
     zip_grp["resid_std"]  = zip_grp["resid_std"].fillna(resid_std)
-    zip_hot_dict     = zip_grp["hot_score"].to_dict()
-    zip_hotprem_dict = zip_grp["resid_median"].to_dict()   # $ premium above fair value
-    zip_pstd_dict    = zip_grp["resid_std"].to_dict()      # price std for CDF model
+
+    # Recency-weighted hotness: last 180 days get 70% weight, full-window 30%.
+    # This prevents stale "hot market" labels from inflating clearing prices in
+    # markets that have since cooled (e.g. 19083 Havertown, where recent CV
+    # residuals are -$15k despite a marginally positive full-window median).
+    if "SOLD_DATE" in results_df.columns:
+        _dates = pd.to_datetime(results_df["SOLD_DATE"])
+        _cutoff = _dates.max() - pd.Timedelta(days=180)
+        _recent_grp = (
+            results_df[_dates >= _cutoff]
+            .groupby("zip")["resid_eval"]
+            .agg(recent_median="median", recent_n="count")
+            .query("recent_n >= 3")
+        )
+        zip_grp = zip_grp.join(_recent_grp, how="left")
+        _fallback = zip_grp["resid_median"]
+        zip_grp["effective_hot"] = (
+            0.30 * zip_grp["hot_score"]
+            + 0.70 * zip_grp["recent_median"].fillna(_fallback) / resid_std
+        )
+    else:
+        zip_grp["effective_hot"] = zip_grp["hot_score"]
+
+    zip_hot_dict          = zip_grp["hot_score"].to_dict()
+    zip_effective_hot_dict = zip_grp["effective_hot"].to_dict()
+    zip_hotprem_dict      = zip_grp["resid_median"].to_dict()   # $ premium above fair value
+    zip_pstd_dict         = zip_grp["resid_std"].to_dict()      # price std for CDF model
 
     zip_city_dict = (
         results_df.dropna(subset=["CITY", "zip"])
@@ -57,20 +104,29 @@ try:
         .to_dict()
     ) if "CITY" in results_df.columns else {}
 
+    # Zip-level lat/lon centroids for spatial feature construction at inference time
+    if "LATITUDE" in results_df.columns and "LONGITUDE" in results_df.columns:
+        _cen = results_df.dropna(subset=["LATITUDE", "LONGITUDE"]).groupby("zip")[["LATITUDE", "LONGITUDE"]].median()
+        zip_centroid_dict = {z: (row["LATITUDE"], row["LONGITUDE"]) for z, row in _cen.iterrows()}
+    else:
+        zip_centroid_dict = {}
+
     map_available = (
         "LATITUDE" in results_df.columns
         and "LONGITUDE" in results_df.columns
         and results_df[["LATITUDE", "LONGITUDE"]].notna().all(axis=1).any()
     )
 except Exception:
-    results_df       = pd.DataFrame()
-    zip_hot_dict     = {}
-    zip_hotprem_dict = {}
-    zip_pstd_dict    = {}
-    zip_city_dict    = {}
-    map_available    = False
+    results_df        = pd.DataFrame()
+    zip_hot_dict           = {}
+    zip_effective_hot_dict = {}
+    zip_hotprem_dict       = {}
+    zip_pstd_dict          = {}
+    zip_city_dict     = {}
+    zip_centroid_dict = {}
+    map_available     = False
 
-# ── PA property tax rates ────────────────────────────────────────────────────
+# ── PA property tax reference rates (for context; mortgage tab uses manual input) ──
 COUNTY_TAX_RATES = {
     "Delaware County":   0.027,
     "Montgomery County": 0.022,
@@ -265,9 +321,30 @@ app.layout = html.Div(
                     html.Div([html.Label("Purchase Price ($)", style=LABEL_STYLE),
                               dcc.Input(id="mort-price", type="number", value=500000,
                                         style=INPUT_STYLE)]),
-                    html.Div([html.Label("Down Payment ($)", style=LABEL_STYLE),
-                              dcc.Input(id="mort-down", type="number", value=100000,
-                                        style=INPUT_STYLE)]),
+                    # Down payment: toggle between % of price or flat $
+                    html.Div([
+                        html.Label("Down Payment", style=LABEL_STYLE),
+                        html.Div(
+                            style={"display": "flex", "alignItems": "center", "gap": "10px",
+                                   "marginBottom": "6px"},
+                            children=[
+                                dcc.RadioItems(
+                                    id="mort-down-mode",
+                                    options=[
+                                        {"label": "% of price", "value": "pct"},
+                                        {"label": "Flat $",     "value": "flat"},
+                                    ],
+                                    value="pct",
+                                    inline=True,
+                                    labelStyle={"fontSize": "12px", "marginRight": "10px"},
+                                ),
+                            ],
+                        ),
+                        dcc.Input(id="mort-down-value", type="number", value=20,
+                                  style=INPUT_STYLE),
+                        html.Div(id="mort-down-hint",
+                                 style={"fontSize": "11px", "color": "#888", "marginTop": "3px"}),
+                    ]),
                     html.Div([html.Label("Interest Rate (%)", style=LABEL_STYLE),
                               dcc.Input(id="mort-rate", type="number", value=6.75,
                                         step=0.125, style=INPUT_STYLE)]),
@@ -278,14 +355,20 @@ app.layout = html.Div(
                                            for y in [30, 20, 15]],
                                   value=30, clearable=False, style={"fontSize": "14px"},
                               )]),
-                    html.Div([html.Label("County (tax rate)", style=LABEL_STYLE),
-                              dcc.Dropdown(
-                                  id="mort-county",
-                                  options=[{"label": k, "value": k}
-                                           for k in COUNTY_TAX_RATES],
-                                  value="Delaware County", clearable=False,
-                                  style={"fontSize": "14px"},
-                              )]),
+                    html.Div([
+                        html.Label("Annual Property Taxes ($)", style=LABEL_STYLE),
+                        dcc.Input(id="mort-annual-tax", type="number", value=8000,
+                                  placeholder="e.g. 8000", style=INPUT_STYLE),
+                        html.P("Enter actual tax bill or county estimate.",
+                               style={"fontSize": "10px", "color": "#aaa", "marginTop": "3px"}),
+                    ]),
+                    html.Div([
+                        html.Label("Annual Home Insurance ($)", style=LABEL_STYLE),
+                        dcc.Input(id="mort-annual-ins", type="number", value=2000,
+                                  placeholder="e.g. 2000", style=INPUT_STYLE),
+                        html.P("Typical range: $1,500–$3,000/yr for this area.",
+                               style={"fontSize": "10px", "color": "#aaa", "marginTop": "3px"}),
+                    ]),
                     html.Div([html.Label("Monthly Gross Income ($)", style=LABEL_STYLE),
                               dcc.Input(id="mort-income", type="number", value=15000,
                                         placeholder="For DTI", style=INPUT_STYLE)]),
@@ -341,29 +424,77 @@ def build_input_row(zip_code, beds, baths, sqft, lot_size, year_built):
     zrow    = (zmatch.iloc[0].to_dict() if not zmatch.empty
                else census_df.median(numeric_only=True).to_dict())
 
+    # Temporal
     BASE_DATE = pd.Timestamp("2024-01-01")
-    months    = max((pd.Timestamp.today() - BASE_DATE).days / 30.44, 0)
-    home_age  = 2026 - year_built
+    now       = pd.Timestamp.today()
+    months    = max((now - BASE_DATE).days / 30.44, 0)
+    month_num = now.month
+    home_age  = now.year - year_built
+
+    # Beds (V2: clipped + quadratic)
+    beds_clean = float(np.clip(beds, 1, 7))
+    beds_sq    = beds_clean ** 2
+
+    # Lot winsorisation (match training: 99th-pct cap)
+    lot_capped          = min(lot_size, LOT_99)
+    log_lot_capped      = math.log1p(lot_capped)
+    sqft_per_lot_capped = sqft / lot_capped if lot_capped > 0 else 0
+
+    # Misc derived
+    is_historic  = int(year_built < 1940)
+    age_historic = home_age * is_historic
+
+    # Spatial: use zip centroid; fall back to dataset mean (→ lat_c/lon_c = 0)
+    lat, lon = zip_centroid_dict.get(zip_str, (LAT_MEAN, LON_MEAN))
+    lat_c    = lat - LAT_MEAN
+    lon_c    = lon - LON_MEAN
+
+    # Census
+    inc      = zrow.get("median_household_income", np.nan)
+    edu      = zrow.get("pct_bachelors_plus", np.nan)
+    commute  = zrow.get("mean_commute_time", np.nan)
+    wealth_edu_idx = (inc * edu) if (not np.isnan(inc) and not np.isnan(edu)) else np.nan
+    commute_sq     = commute ** 2 if not np.isnan(commute) else np.nan
 
     row = {
-        "BATHS": baths, "SQUARE_FEET": sqft, "LOT_SIZE": lot_size,
-        "home_age":        home_age,
-        "bath_bed_ratio":  baths / beds if beds > 0 else 0,
-        "sqft_per_bed":    sqft / beds  if beds > 0 else 0,
-        "log_sqft":        np.log1p(sqft),
-        "log_lot_size":    np.log1p(lot_size),
-        "months_since_base": months,
-        # New features (no-ops if model predates these)
-        "log_home_age":    np.log1p(home_age),
-        "sqft_per_lot":    sqft / lot_size if lot_size > 0 else 0,
-        "is_historic":     int(year_built < 1940),
+        # V2 bed features
+        "BEDS_clean":          beds_clean,
+        "beds_sq":             beds_sq,
+        # Core size
+        "BATHS":               baths,
+        "SQUARE_FEET":         sqft,
+        "log_sqft":            math.log1p(sqft),
+        # Lot (winsorised)
+        "lot_capped":          lot_capped,
+        "log_lot_capped":      log_lot_capped,
+        "sqft_per_lot_capped": sqft_per_lot_capped,
+        # Age
+        "home_age":            home_age,
+        "log_home_age":        math.log1p(home_age),
+        "is_historic":         is_historic,
+        "age_historic_x":      age_historic,
+        # Ratios
+        "bath_bed_ratio":      baths / beds if beds > 0 else 0,
+        "sqft_per_bed":        sqft / beds  if beds > 0 else 0,
+        "bath_per_sqft":       baths / sqft if sqft > 0 else 0,
+        # Temporal
+        "months_since_base":   months,
+        "sin_month":           math.sin(2 * math.pi * month_num / 12),
+        "cos_month":           math.cos(2 * math.pi * month_num / 12),
+        "is_spring":           int(month_num in (3, 4, 5, 6)),
+        # Spatial
+        "lat_c":               lat_c,
+        "lon_c":               lon_c,
+        "lat_sq":              lat_c ** 2,
+        "lon_sq":              lon_c ** 2,
+        "lat_lon_x":           lat_c * lon_c,
+        # Census composites
+        "wealth_edu_idx":      wealth_edu_idx,
+        "commute_sq":          commute_sq,
+        "income_sqft_idx":     inc / sqft if (sqft > 0 and not np.isnan(inc)) else np.nan,
     }
     for feat in CENSUS_FEATURES:
         row[feat] = zrow.get(feat, np.nan)
-
-    # Derived census feature
-    inc = zrow.get("median_household_income", np.nan)
-    row["income_sqft_idx"] = inc / sqft if (sqft > 0 and not np.isnan(inc)) else np.nan
 
     return row
 
@@ -399,10 +530,23 @@ def estimate(n_clicks, zip_code, beds, baths, sqft, lot_size,
         input_row[pt_col] = 1
     input_df = pd.DataFrame([input_row])[feature_cols]
 
-    fair = model.predict(input_df)[0]
-    low  = fair - 1.28 * resid_std
-    high = fair + 1.28 * resid_std
-    hb   = fair + resid_std
+    raw_pred = model.predict(input_df)[0]
+    # v3: model trained on log(price) — exp() to get dollar fair value
+    fair = float(np.exp(raw_pred) if LOG_TARGET_MODEL else raw_pred)
+
+    # 80% PI: quantile models (proportional width) preferred over fixed ±1.28σ
+    if quantile_lo is not None and quantile_hi is not None:
+        raw_lo = quantile_lo.predict(input_df)[0]
+        raw_hi = quantile_hi.predict(input_df)[0]
+        low  = float(np.exp(raw_lo) if LOG_TARGET_MODEL else raw_lo)
+        high = float(np.exp(raw_hi) if LOG_TARGET_MODEL else raw_hi)
+    else:
+        seg_s = _segment_sigma(fair)
+        low   = fair - 1.28 * seg_s
+        high  = fair + 1.28 * seg_s
+
+    # Highest & best: fair + 1× segment-specific sigma (≈84th pctile within segment)
+    hb = fair + _segment_sigma(fair)
 
     dom_disc = 0
     if dom >= 45:
@@ -414,7 +558,8 @@ def estimate(n_clicks, zip_code, beds, baths, sqft, lot_size,
     zip_str   = str(zip_code).zfill(5)[:5]
     city_name = zip_city_dict.get(zip_str, "")
     zip_disp  = f"{zip_str} – {city_name}" if city_name else zip_str
-    hot_score = zip_hot_dict.get(zip_str, 0)
+    hot_score      = zip_hot_dict.get(zip_str, 0)
+    effective_hot  = zip_effective_hot_dict.get(zip_str, hot_score)
 
     # ── Gauge ─────────────────────────────────────────────────────────────
     gauge_min = max(0, low * 0.90)
@@ -442,6 +587,25 @@ def estimate(n_clicks, zip_code, beds, baths, sqft, lot_size,
     gauge.update_layout(height=260, margin=dict(t=60, b=10, l=20, r=20))
 
     cards = [dcc.Graph(figure=gauge, config={"displayModeBar": False})]
+
+    # Luxury extrapolation warning — model trained up to MODEL_PRICE_MAX
+    if fair > MODEL_PRICE_MAX * 0.90:
+        cards.append(html.Div(
+            style={**CARD, "backgroundColor": "#fdf2e9", "border": "1px solid #e59866",
+                   "textAlign": "left"},
+            children=[
+                html.Div("Extrapolation Notice",
+                         style={"fontSize": "12px", "fontWeight": "700",
+                                "color": "#ca6f1e", "marginBottom": "4px"}),
+                html.Div(
+                    f"This estimate (${fair:,.0f}) is near or above the model's "
+                    f"training ceiling (${MODEL_PRICE_MAX:,.0f}). "
+                    "Prediction intervals are wider and less reliable for luxury properties. "
+                    "Treat the range as directional only.",
+                    style={"fontSize": "11px", "color": "#784212"},
+                ),
+            ],
+        ))
 
     # Core range + highest & best
     cards.append(html.Div(
@@ -473,13 +637,14 @@ def estimate(n_clicks, zip_code, beds, baths, sqft, lot_size,
                      style={"fontSize": "17px", "fontWeight": "bold", "color": "#1e8449"}),
         ]))
 
-    # Zip hotness pill
-    if abs(hot_score) > 0.2:
-        hot_color = "#e74c3c" if hot_score > 0 else "#27ae60"
-        label = "Hot Market" if hot_score > 0 else "Cool Market"
-        delta_k = abs(hot_score * resid_std / 1000)
-        direction = "above" if hot_score > 0 else "below"
-        note = "Expect competitive offers." if hot_score > 0 else "Negotiation room possible."
+    # Zip hotness pill — uses recency-weighted effective_hot so it reflects
+    # current market conditions, not just the full training-window average.
+    if abs(effective_hot) > 0.15:
+        hot_color = "#e74c3c" if effective_hot > 0 else "#27ae60"
+        label = "Hot Market" if effective_hot > 0 else "Cool Market"
+        delta_k = abs(effective_hot * resid_std / 1000)
+        direction = "above" if effective_hot > 0 else "below"
+        note = "Expect competitive offers." if effective_hot > 0 else "Negotiation room possible."
         cards.append(html.Div(
             style={**CARD, "backgroundColor": "#fdfefe",
                    "border": f"1px solid {hot_color}"},
@@ -487,8 +652,8 @@ def estimate(n_clicks, zip_code, beds, baths, sqft, lot_size,
                 html.Div(f"{label} — {zip_str}",
                          style={"fontWeight": "bold", "color": hot_color, "fontSize": "14px"}),
                 html.Div(
-                    f"Homes in this zip typically sell ${delta_k:.0f}k {direction} "
-                    f"model estimate. {note}",
+                    f"Recent sales in this zip are running ${delta_k:.0f}k {direction} "
+                    f"model estimate (recency-weighted). {note}",
                     style={"fontSize": "12px", "color": "#555", "marginTop": "4px"},
                 ),
             ],
@@ -547,12 +712,25 @@ def estimate(n_clicks, zip_code, beds, baths, sqft, lot_size,
             # If list < fair (underpriced): more competing bids → higher clearing price
             # If list > fair (overpriced):  fewer bids → lower clearing price
             hotness_prem = zip_hotprem_dict.get(zip_str, 0.0)
-            price_std    = zip_pstd_dict.get(zip_str, resid_std)
+            # v3: use segment sigma (price-level aware) as the clearing price dispersion
+            price_std    = zip_pstd_dict.get(zip_str, _segment_sigma(fair))
             dom_factor   = max(0.5, 1.0 - (dom - 30) / 300) if dom >= 30 else 1.0
             list_val     = float(list_price) if list_price else fair
-            gap_adj      = (fair - list_val) * 0.35   # +adj if underpriced, -adj if overpriced
-            mu_clear     = fair + hotness_prem * dom_factor + gap_adj
-            prob_win     = scipy_stats.norm.cdf(bid, loc=mu_clear, scale=price_std)
+
+            # Recency-weighted anchor blending:
+            # anchor_wt smoothly transitions the clearing price base from fair value
+            # (cool/neutral market) to list price (hot market).  We use effective_hot
+            # (70% weight on last 180 days + 30% full window) so the model reflects
+            # the CURRENT market temperature rather than stale training-window averages.
+            # A market must score ≥ 0.5 on the recency-weighted scale before the anchor
+            # fully shifts to list price — marginal positives (like 19083's 0.024 global
+            # hot_score) no longer incorrectly trigger the competitive anchor.
+            anchor_wt  = max(0.0, min(1.0, effective_hot * 2.0)) if list_price else 0.0
+            base_price = fair * (1 - anchor_wt) + list_val * anchor_wt
+            gap_adj    = (fair - list_val) * 0.25 * (1 - anchor_wt) if list_price else 0.0
+
+            mu_clear  = base_price + hotness_prem * dom_factor + gap_adj
+            prob_win  = scipy_stats.norm.cdf(bid, loc=mu_clear, scale=price_std)
 
             if   prob_win >= 0.80: strength, s_color = "Very Strong",  "#1e8449"
             elif prob_win >= 0.65: strength, s_color = "Strong",       "#27ae60"
@@ -587,7 +765,7 @@ def estimate(n_clicks, zip_code, beds, baths, sqft, lot_size,
                                          style={"fontWeight": "600", "fontSize": "14px"}),
                                 html.Div(
                                     f"hotness {hotness_prem:+,.0f}"
-                                    + (f" · list {gap_adj:+,.0f}" if list_price else ""),
+                                    + (f" · anchor: {anchor_wt*100:.0f}% list / {(1-anchor_wt)*100:.0f}% FV" if list_price else ""),
                                     style={"fontSize": "10px", "color": "#aaa"},
                                 ),
                             ]),
@@ -697,8 +875,8 @@ def update_map(zip_filter, color_by, price_range):
     if not map_available or results_df.empty:
         fig = go.Figure()
         fig.update_layout(
-            mapbox_style="open-street-map",
-            mapbox=dict(center=dict(lat=39.98, lon=-75.38), zoom=9),
+            map_style="open-street-map",
+            map=dict(center=dict(lat=39.98, lon=-75.38), zoom=9),
             margin=dict(t=0, b=0, l=0, r=0), height=500,
             annotations=[dict(text="Run 02_modeling.ipynb to generate results data.",
                               x=0.5, y=0.5, xref="paper", yref="paper",
@@ -726,26 +904,52 @@ def update_map(zip_filter, color_by, price_range):
         ), axis=1
     )
 
-    color_data   = df[color_by]
-    colorscale   = "RdYlGn" if color_by == "resid_eval" else "Blues"
-    colorbar_ttl = "Residual ($)" if color_by == "resid_eval" else "Sale Price ($)"
+    if color_by == "resid_eval":
+        # Residual view: dot size encodes sale price, color encodes residual direction.
+        # Positive residual (sold > model) → red (expensive relative to model).
+        # Negative residual (sold < model) → green (cheap relative to model).
+        price_min, price_max = df["PRICE"].min(), df["PRICE"].max()
+        price_range_span = max(price_max - price_min, 1)
+        dot_sizes = 5 + 14 * (df["PRICE"] - price_min) / price_range_span
 
-    fig = go.Figure(go.Scattermapbox(
-        lat=df["LATITUDE"], lon=df["LONGITUDE"],
-        mode="markers",
-        marker=dict(
-            size=7, opacity=0.7,
-            color=color_data,
-            colorscale=colorscale,
-            showscale=True,
-            colorbar=dict(title=colorbar_ttl, thickness=14),
-        ),
-        text=hover,
-        hoverinfo="text",
-    ))
+        resid_abs_max = df["resid_eval"].abs().quantile(0.95)
+        resid_abs_max = max(resid_abs_max, 1)
+
+        fig = go.Figure(go.Scattermap(
+            lat=df["LATITUDE"], lon=df["LONGITUDE"],
+            mode="markers",
+            marker=dict(
+                size=dot_sizes, opacity=0.75,
+                color=df["resid_eval"],
+                colorscale="RdYlGn_r",   # red = positive resid (sold above model)
+                cmin=-resid_abs_max,
+                cmax=resid_abs_max,
+                showscale=True,
+                colorbar=dict(
+                    title="Residual ($)<br><sup>+ sold above model · − sold below</sup>",
+                    thickness=14,
+                ),
+            ),
+            text=hover,
+            hoverinfo="text",
+        ))
+    else:
+        fig = go.Figure(go.Scattermap(
+            lat=df["LATITUDE"], lon=df["LONGITUDE"],
+            mode="markers",
+            marker=dict(
+                size=7, opacity=0.7,
+                color=df["PRICE"],
+                colorscale="Blues",
+                showscale=True,
+                colorbar=dict(title="Sale Price ($)", thickness=14),
+            ),
+            text=hover,
+            hoverinfo="text",
+        ))
     fig.update_layout(
-        mapbox_style="open-street-map",
-        mapbox=dict(center=dict(lat=39.98, lon=-75.38), zoom=9.5),
+        map_style="open-street-map",
+        map=dict(center=dict(lat=39.98, lon=-75.38), zoom=9.5),
         margin=dict(t=0, b=0, l=0, r=0),
         height=520,
     )
@@ -781,32 +985,67 @@ def update_map(zip_filter, color_by, price_range):
                                         "marginTop": "8px"})
 
 
+# ── Down payment hint (live feedback) ────────────────────────────────────────
+@app.callback(
+    Output("mort-down-hint", "children"),
+    Input("mort-down-mode",  "value"),
+    Input("mort-down-value", "value"),
+    Input("mort-price",      "value"),
+)
+def update_down_hint(mode, down_val, price):
+    try:
+        p = float(price or 500_000)
+        v = float(down_val or 0)
+    except (TypeError, ValueError):
+        return ""
+    if mode == "pct":
+        dollar = p * v / 100
+        return f"= ${dollar:,.0f}"
+    else:
+        if p > 0:
+            pct = v / p * 100
+            return f"= {pct:.1f}% of purchase price"
+        return ""
+
+
 # ── Mortgage callback ─────────────────────────────────────────────────────────
 @app.callback(
     Output("mortgage-output", "children"),
     Input("mort-btn", "n_clicks"),
     [
         State("mort-price",       "value"),
-        State("mort-down",        "value"),
+        State("mort-down-mode",   "value"),
+        State("mort-down-value",  "value"),
         State("mort-rate",        "value"),
         State("mort-term",        "value"),
-        State("mort-county",      "value"),
+        State("mort-annual-tax",  "value"),
+        State("mort-annual-ins",  "value"),
         State("mort-income",      "value"),
         State("mort-other-debts", "value"),
     ],
     prevent_initial_call=True,
 )
-def calculate_mortgage(n_clicks, price, down, rate, term, county, gross_income, other_debts):
+def calculate_mortgage(n_clicks, price, down_mode, down_val, rate, term,
+                       annual_tax, annual_ins, gross_income, other_debts):
     try:
-        price       = float(price       or 500_000)
-        down        = float(down        or 100_000)
-        rate        = float(rate        or 6.75)
-        term        = int(term          or 30)
+        price       = float(price        or 500_000)
+        down_val    = float(down_val     or 20)
+        rate        = float(rate         or 6.75)
+        term        = int(term           or 30)
+        annual_tax  = float(annual_tax   or 0)
+        annual_ins  = float(annual_ins   or 0)
         gross       = float(gross_income or 0)
         other_debts = float(other_debts  or 0)
     except (TypeError, ValueError):
         return html.P("Please fill in valid numbers.", style={"color": "red"})
 
+    # Resolve down payment to dollar amount
+    if (down_mode or "pct") == "pct":
+        down = price * down_val / 100
+    else:
+        down = down_val
+
+    down = min(down, price)   # can't put down more than the price
     loan     = price - down
     down_pct = down / price * 100
 
@@ -815,15 +1054,27 @@ def calculate_mortgage(n_clicks, price, down, rate, term, county, gross_income, 
     n = term * 12
     pi = loan * r * (1 + r) ** n / ((1 + r) ** n - 1) if r > 0 else loan / n
 
-    # Property tax (PA varies by county)
-    tax_rate    = COUNTY_TAX_RATES.get(county, 0.022)
-    monthly_tax = price * tax_rate / 12
+    # Property tax and insurance from manual inputs
+    monthly_tax = annual_tax / 12
+    monthly_ins = annual_ins / 12
 
-    # Insurance (~0.4% of value)
-    monthly_ins = max(125, price * 0.004 / 12)
+    # PMI at 0.20% of original loan annually (≈ $100/mo on $600k), applied
+    # only until the balance falls to 80% LTV.  We compute the exact drop-off
+    # month from the amortization schedule so we can display it accurately.
+    pmi_monthly = (loan * 0.002 / 12) if down_pct < 20 else 0
 
-    # PMI if < 20% down
-    pmi = (loan * 0.008 / 12) if down_pct < 20 else 0
+    # Find the month when balance first drops to ≤ 80% of purchase price
+    pmi_drop_month = None
+    if pmi_monthly > 0:
+        _bal = loan
+        for _m in range(1, n + 1):
+            _bal -= (pi - _bal * r)
+            if _bal <= price * 0.80:
+                pmi_drop_month = _m
+                break
+
+    # PMI only applies until drop-off; use initial monthly value for payment display
+    pmi = pmi_monthly
 
     total = pi + monthly_tax + monthly_ins + pmi
 
@@ -838,8 +1089,8 @@ def calculate_mortgage(n_clicks, price, down, rate, term, county, gross_income, 
     )
 
     # DTI
-    dti_h = total / gross * 100       if gross > 0 else None
-    dti_t = (total + other_debts) / gross * 100 if gross > 0 else None
+    dti_h = total / gross * 100                      if gross > 0 else None
+    dti_t = (total + other_debts) / gross * 100      if gross > 0 else None
 
     def dti_color(v, warn, bad):
         return "#27ae60" if v < warn else ("#f39c12" if v < bad else "#e74c3c")
@@ -890,31 +1141,49 @@ def calculate_mortgage(n_clicks, price, down, rate, term, county, gross_income, 
                     html.Div("Property Tax", style={"fontSize": "11px", "color": "#555"}),
                     html.Div(f"${monthly_tax:,.0f}/mo",
                              style={"fontWeight": "bold", "fontSize": "18px"}),
-                    html.Div(f"{tax_rate * 100:.1f}% annual ({county})",
+                    html.Div(f"${annual_tax:,.0f}/yr (manual input)",
                              style={"fontSize": "10px", "color": "#999"}),
                 ]),
                 html.Div(style={**C2, "backgroundColor": "#f4ecf7"}, children=[
-                    html.Div("Insurance (est.)", style={"fontSize": "11px", "color": "#555"}),
+                    html.Div("Home Insurance", style={"fontSize": "11px", "color": "#555"}),
                     html.Div(f"${monthly_ins:,.0f}/mo",
                              style={"fontWeight": "bold", "fontSize": "18px"}),
+                    html.Div(f"${annual_ins:,.0f}/yr (manual input)",
+                             style={"fontSize": "10px", "color": "#999"}),
                 ]),
             ],
         ),
     ]
 
     if pmi > 0:
+        if pmi_drop_month:
+            drop_yr  = pmi_drop_month // 12
+            drop_mo  = pmi_drop_month % 12
+            drop_str = (
+                f"Month {pmi_drop_month} — "
+                + (f"Year {drop_yr}" if drop_mo == 0 else f"Year {drop_yr}, Month {drop_mo}")
+            )
+        else:
+            drop_str = "not reached within loan term"
         output.append(html.Div(style={**C2, "backgroundColor": "#fdebd0"}, children=[
             html.Div(f"PMI ({down_pct:.1f}% down — below 20%)",
                      style={"fontSize": "11px", "color": "#935116"}),
-            html.Div(f"+${pmi:,.0f}/mo  (until 80% LTV reached)",
+            html.Div(f"+${pmi:,.0f}/mo",
                      style={"fontWeight": "bold", "fontSize": "15px", "color": "#935116"}),
+            html.Div(f"Rate: 0.20% of loan/year  ·  drops at 80% LTV: {drop_str}",
+                     style={"fontSize": "10px", "color": "#b7770d"}),
         ]))
 
     # Total
+    total_after_pmi = total - pmi  # payment once PMI drops off
+    pmi_note = (
+        f"  ·  drops to ${total_after_pmi:,.0f}/mo after PMI"
+        if pmi > 0 and pmi_drop_month else ""
+    )
     output.append(html.Div(style={**C2, "backgroundColor": "#2c3e50", "color": "white"}, children=[
         html.Div("Total Monthly Payment", style={"fontSize": "12px", "opacity": "0.8"}),
         html.Div(f"${total:,.0f}/mo", style={"fontWeight": "bold", "fontSize": "26px"}),
-        html.Div(f"Loan ${loan:,.0f}  ·  {down_pct:.1f}% down  ·  {term}yr @ {rate:.2f}%",
+        html.Div(f"Loan ${loan:,.0f}  ·  {down_pct:.1f}% down  ·  {term}yr @ {rate:.2f}%{pmi_note}",
                  style={"fontSize": "11px", "opacity": "0.7", "marginTop": "4px"}),
     ]))
 
@@ -958,6 +1227,8 @@ def calculate_mortgage(n_clicks, price, down, rate, term, county, gross_income, 
 
     output.append(dcc.Graph(figure=eq_fig, config={"displayModeBar": False}))
     return output
+
+
 
 
 if __name__ == "__main__":
