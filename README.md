@@ -1,6 +1,6 @@
 # Philly Home Valuator
 
-A hedonic pricing model for residential properties in the Philadelphia suburbs (Delaware, Montgomery, Chester, and Bucks Counties), built to support data-driven offer decisions during a home search.
+Pricing model for residential properties in the Philadelphia suburbs (Delaware, Montgomery, Chester, and Bucks Counties), built to support data-driven offer decisions during the home search process.
 
 ## What it does
 
@@ -84,7 +84,7 @@ This prevents unrealistically high win probabilities for below-ask bids in hot z
 1. Sale prices from the past 12 months are representative of current market conditions.
 2. Census ACS 5-year estimates proxy neighbourhood quality at the ZCTA level.
 3. The hedonic framework assumes approximate additive separability of attribute contributions — reasonable for suburban housing but may under-weight hyper-local effects (school catchment, block-level desirability).
-4. `pct_white` is intentionally excluded from the feature set (Fair Housing Act considerations).
+4. `pct_white` is intentionally excluded from the feature set.
 5. PMI is estimated at 0.20%/month of the loan balance (≈ 2.4% annually) for down payments < 20%.
 
 ## Quick start
